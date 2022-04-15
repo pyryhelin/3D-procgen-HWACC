@@ -1,0 +1,696 @@
+// Each #kernel tells which function to compile; you can have many kernels
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+
+
+#ifndef NOISE_SIMPLEX_FUNC
+#define NOISE_SIMPLEX_FUNC
+/*
+Description:
+	Array- and textureless CgFx/HLSL 2D, 3D and 4D simplex noise functions.
+	a.k.a. simplified and optimized Perlin noise.
+	
+	The functions have very good performance
+	and no dependencies on external data.
+	
+	2D - Very fast, very compact code.
+	3D - Fast, compact code.
+	4D - Reasonably fast, reasonably compact code.
+------------------------------------------------------------------
+Ported by:
+	Lex-DRL
+	I've ported the code from GLSL to CgFx/HLSL for Unity,
+	added a couple more optimisations (to speed it up even further)
+	and slightly reformatted the code to make it more readable.
+Original GLSL functions:
+	https://github.com/ashima/webgl-noise
+	Credits from original glsl file are at the end of this cginc.
+------------------------------------------------------------------
+Usage:
+	
+	float ns = snoise(v);
+	// v is any of: float2, float3, float4
+	
+	Return type is float.
+	To generate 2 or more components of noise (colorful noise),
+	call these functions several times with different
+	constant offsets for the arguments.
+	E.g.:
+	
+	float3 colorNs = float3(
+		snoise(v),
+		snoise(v + 17.0),
+		snoise(v - 43.0),
+	);
+Remark about those offsets from the original author:
+	
+	People have different opinions on whether these offsets should be integers
+	for the classic noise functions to match the spacing of the zeroes,
+	so we have left that for you to decide for yourself.
+	For most applications, the exact offsets don't really matter as long
+	as they are not too small or too close to the noise lattice period
+	(289 in this implementation).
+*/
+
+// 1 / 289
+#define NOISE_SIMPLEX_1_DIV_289 0.00346020761245674740484429065744f
+
+float mod289(float x) {
+	return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+float2 mod289(float2 x) {
+	return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+float3 mod289(float3 x) {
+	return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+float4 mod289(float4 x) {
+	return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+
+// ( x*34.0 + 1.0 )*x = 
+// x*x*34.0 + x
+float permute(float x) {
+	return mod289(
+		x*x*34.0 + x
+	);
+}
+
+float3 permute(float3 x) {
+	return mod289(
+		x*x*34.0 + x
+	);
+}
+
+float4 permute(float4 x) {
+	return mod289(
+		x*x*34.0 + x
+	);
+}
+
+
+
+float4 grad4(float j, float4 ip)
+{
+	const float4 ones = float4(1.0, 1.0, 1.0, -1.0);
+	float4 p, s;
+	p.xyz = floor( frac(j * ip.xyz) * 7.0) * ip.z - 1.0;
+	p.w = 1.5 - dot( abs(p.xyz), ones.xyz );
+	
+	// GLSL: lessThan(x, y) = x < y
+	// HLSL: 1 - step(y, x) = x < y
+	p.xyz -= sign(p.xyz) * (p.w < 0);
+	
+	return p;
+}
+
+
+
+// ----------------------------------- 2D -------------------------------------
+
+float snoise(float2 v)
+{
+	const float4 C = float4(
+		0.211324865405187, // (3.0-sqrt(3.0))/6.0
+		0.366025403784439, // 0.5*(sqrt(3.0)-1.0)
+	 -0.577350269189626, // -1.0 + 2.0 * C.x
+		0.024390243902439  // 1.0 / 41.0
+	);
+	
+// First corner
+	float2 i = floor( v + dot(v, C.yy) );
+	float2 x0 = v - i + dot(i, C.xx);
+	
+// Other corners
+	// float2 i1 = (x0.x > x0.y) ? float2(1.0, 0.0) : float2(0.0, 1.0);
+	// Lex-DRL: afaik, step() in GPU is faster than if(), so:
+	// step(x, y) = x <= y
+	
+	// Actually, a simple conditional without branching is faster than that madness :)
+	int2 i1 = (x0.x > x0.y) ? float2(1.0, 0.0) : float2(0.0, 1.0);
+	float4 x12 = x0.xyxy + C.xxzz;
+	x12.xy -= i1;
+	
+// Permutations
+	i = mod289(i); // Avoid truncation effects in permutation
+	float3 p = permute(
+		permute(
+				i.y + float3(0.0, i1.y, 1.0 )
+		) + i.x + float3(0.0, i1.x, 1.0 )
+	);
+	
+	float3 m = max(
+		0.5 - float3(
+			dot(x0, x0),
+			dot(x12.xy, x12.xy),
+			dot(x12.zw, x12.zw)
+		),
+		0.0
+	);
+	m = m*m ;
+	m = m*m ;
+	
+// Gradients: 41 points uniformly over a line, mapped onto a diamond.
+// The ring size 17*17 = 289 is close to a multiple of 41 (41*7 = 287)
+	
+	float3 x = 2.0 * frac(p * C.www) - 1.0;
+	float3 h = abs(x) - 0.5;
+	float3 ox = floor(x + 0.5);
+	float3 a0 = x - ox;
+
+// Normalise gradients implicitly by scaling m
+// Approximation of: m *= inversesqrt( a0*a0 + h*h );
+	m *= 1.79284291400159 - 0.85373472095314 * ( a0*a0 + h*h );
+
+// Compute final noise value at P
+	float3 g;
+	g.x = a0.x * x0.x + h.x * x0.y;
+	g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+	return 130.0 * dot(m, g);
+}
+
+// ----------------------------------- 3D -------------------------------------
+
+float snoise(float3 v)
+{
+	const float2 C = float2(
+		0.166666666666666667, // 1/6
+		0.333333333333333333  // 1/3
+	);
+	const float4 D = float4(0.0, 0.5, 1.0, 2.0);
+	
+// First corner
+	float3 i = floor( v + dot(v, C.yyy) );
+	float3 x0 = v - i + dot(i, C.xxx);
+	
+// Other corners
+	float3 g = step(x0.yzx, x0.xyz);
+	float3 l = 1 - g;
+	float3 i1 = min(g.xyz, l.zxy);
+	float3 i2 = max(g.xyz, l.zxy);
+	
+	float3 x1 = x0 - i1 + C.xxx;
+	float3 x2 = x0 - i2 + C.yyy; // 2.0*C.x = 1/3 = C.y
+	float3 x3 = x0 - D.yyy;      // -1.0+3.0*C.x = -0.5 = -D.y
+	
+// Permutations
+	i = mod289(i);
+	float4 p = permute(
+		permute(
+			permute(
+					i.z + float4(0.0, i1.z, i2.z, 1.0 )
+			) + i.y + float4(0.0, i1.y, i2.y, 1.0 )
+		) 	+ i.x + float4(0.0, i1.x, i2.x, 1.0 )
+	);
+	
+// Gradients: 7x7 points over a square, mapped onto an octahedron.
+// The ring size 17*17 = 289 is close to a multiple of 49 (49*6 = 294)
+	float n_ = 0.142857142857; // 1/7
+	float3 ns = n_ * D.wyz - D.xzx;
+	
+	float4 j = p - 49.0 * floor(p * ns.z * ns.z); // mod(p,7*7)
+	
+	float4 x_ = floor(j * ns.z);
+	float4 y_ = floor(j - 7.0 * x_ ); // mod(j,N)
+	
+	float4 x = x_ *ns.x + ns.yyyy;
+	float4 y = y_ *ns.x + ns.yyyy;
+	float4 h = 1.0 - abs(x) - abs(y);
+	
+	float4 b0 = float4( x.xy, y.xy );
+	float4 b1 = float4( x.zw, y.zw );
+	
+	//float4 s0 = float4(lessThan(b0,0.0))*2.0 - 1.0;
+	//float4 s1 = float4(lessThan(b1,0.0))*2.0 - 1.0;
+	float4 s0 = floor(b0)*2.0 + 1.0;
+	float4 s1 = floor(b1)*2.0 + 1.0;
+	float4 sh = -step(h, 0.0);
+	
+	float4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+	float4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+	
+	float3 p0 = float3(a0.xy,h.x);
+	float3 p1 = float3(a0.zw,h.y);
+	float3 p2 = float3(a1.xy,h.z);
+	float3 p3 = float3(a1.zw,h.w);
+	
+//Normalise gradients
+	float4 norm = rsqrt(float4(
+		dot(p0, p0),
+		dot(p1, p1),
+		dot(p2, p2),
+		dot(p3, p3)
+	));
+	p0 *= norm.x;
+	p1 *= norm.y;
+	p2 *= norm.z;
+	p3 *= norm.w;
+	
+// Mix final noise value
+	float4 m = max(
+		0.6 - float4(
+			dot(x0, x0),
+			dot(x1, x1),
+			dot(x2, x2),
+			dot(x3, x3)
+		),
+		0.0
+	);
+	m = m * m;
+	return 42.0 * dot(
+		m*m,
+		float4(
+			dot(p0, x0),
+			dot(p1, x1),
+			dot(p2, x2),
+			dot(p3, x3)
+		)
+	);
+}
+
+// ----------------------------------- 4D -------------------------------------
+
+float snoise(float4 v)
+{
+	const float4 C = float4(
+		0.138196601125011, // (5 - sqrt(5))/20 G4
+		0.276393202250021, // 2 * G4
+		0.414589803375032, // 3 * G4
+	 -0.447213595499958  // -1 + 4 * G4
+	);
+
+// First corner
+	float4 i = floor(
+		v +
+		dot(
+			v,
+			0.309016994374947451 // (sqrt(5) - 1) / 4
+		)
+	);
+	float4 x0 = v - i + dot(i, C.xxxx);
+
+// Other corners
+
+// Rank sorting originally contributed by Bill Licea-Kane, AMD (formerly ATI)
+	float4 i0;
+	float3 isX = step( x0.yzw, x0.xxx );
+	float3 isYZ = step( x0.zww, x0.yyz );
+	i0.x = isX.x + isX.y + isX.z;
+	i0.yzw = 1.0 - isX;
+	i0.y += isYZ.x + isYZ.y;
+	i0.zw += 1.0 - isYZ.xy;
+	i0.z += isYZ.z;
+	i0.w += 1.0 - isYZ.z;
+
+	// i0 now contains the unique values 0,1,2,3 in each channel
+	float4 i3 = saturate(i0);
+	float4 i2 = saturate(i0-1.0);
+	float4 i1 = saturate(i0-2.0);
+
+	//	x0 = x0 - 0.0 + 0.0 * C.xxxx
+	//	x1 = x0 - i1  + 1.0 * C.xxxx
+	//	x2 = x0 - i2  + 2.0 * C.xxxx
+	//	x3 = x0 - i3  + 3.0 * C.xxxx
+	//	x4 = x0 - 1.0 + 4.0 * C.xxxx
+	float4 x1 = x0 - i1 + C.xxxx;
+	float4 x2 = x0 - i2 + C.yyyy;
+	float4 x3 = x0 - i3 + C.zzzz;
+	float4 x4 = x0 + C.wwww;
+
+// Permutations
+	i = mod289(i); 
+	float j0 = permute(
+		permute(
+			permute(
+				permute(i.w) + i.z
+			) + i.y
+		) + i.x
+	);
+	float4 j1 = permute(
+		permute(
+			permute(
+				permute (
+					i.w + float4(i1.w, i2.w, i3.w, 1.0 )
+				) + i.z + float4(i1.z, i2.z, i3.z, 1.0 )
+			) + i.y + float4(i1.y, i2.y, i3.y, 1.0 )
+		) + i.x + float4(i1.x, i2.x, i3.x, 1.0 )
+	);
+
+// Gradients: 7x7x6 points over a cube, mapped onto a 4-cross polytope
+// 7*7*6 = 294, which is close to the ring size 17*17 = 289.
+	const float4 ip = float4(
+		0.003401360544217687075, // 1/294
+		0.020408163265306122449, // 1/49
+		0.142857142857142857143, // 1/7
+		0.0
+	);
+
+	float4 p0 = grad4(j0, ip);
+	float4 p1 = grad4(j1.x, ip);
+	float4 p2 = grad4(j1.y, ip);
+	float4 p3 = grad4(j1.z, ip);
+	float4 p4 = grad4(j1.w, ip);
+
+// Normalise gradients
+	float4 norm = rsqrt(float4(
+		dot(p0, p0),
+		dot(p1, p1),
+		dot(p2, p2),
+		dot(p3, p3)
+	));
+	p0 *= norm.x;
+	p1 *= norm.y;
+	p2 *= norm.z;
+	p3 *= norm.w;
+	p4 *= rsqrt( dot(p4, p4) );
+
+// Mix contributions from the five corners
+	float3 m0 = max(
+		0.6 - float3(
+			dot(x0, x0),
+			dot(x1, x1),
+			dot(x2, x2)
+		),
+		0.0
+	);
+	float2 m1 = max(
+		0.6 - float2(
+			dot(x3, x3),
+			dot(x4, x4)
+		),
+		0.0
+	);
+	m0 = m0 * m0;
+	m1 = m1 * m1;
+	
+	return 49.0 * (
+		dot(
+			m0*m0,
+			float3(
+				dot(p0, x0),
+				dot(p1, x1),
+				dot(p2, x2)
+			)
+		) + dot(
+			m1*m1,
+			float2(
+				dot(p3, x3),
+				dot(p4, x4)
+			)
+		)
+	);
+}
+
+
+
+//                 Credits from source glsl file:
+//
+// Description : Array and textureless GLSL 2D/3D/4D simplex 
+//               noise functions.
+//      Author : Ian McEwan, Ashima Arts.
+//  Maintainer : ijm
+//     Lastmod : 20110822 (ijm)
+//     License : Copyright (C) 2011 Ashima Arts. All rights reserved.
+//               Distributed under the MIT License. See LICENSE file.
+//               https://github.com/ashima/webgl-noise
+//
+//
+//           The text from LICENSE file:
+//
+//
+// Copyright (C) 2011 by Ashima Arts (Simplex noise)
+// Copyright (C) 2011 by Stefan Gustavson (Classic noise)
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+#endif
+
+//RWTexture2D<float4> Result;
+
+#include "./MarchingTables.compute"
+
+float Scale;
+float xOffset;
+float yOffset;
+float zOffset;
+int Width;
+int Hieght;
+
+struct Vertex{
+    float3 Position;
+    float val;
+    float4 Color;
+};
+
+
+
+int chunk_size;
+float4 chunk_offset;
+
+RWStructuredBuffer<Vertex> _Buffer;
+
+#pragma kernel CSMain
+#pragma kernel Marching
+
+float map(float input, float min1, float max1, float min2, float max2)
+{
+    float perc = (input - min1) / (max1 - min1);
+    float value = perc * (max2 - min2) + min2;
+    return value;
+}
+static int thread_count = 8;
+[numthreads(thread_count,thread_count,thread_count)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{   
+
+    
+    //float noise = snoise(float3(xOffset + id.x / Scale,+ yOffset + id.y / Scale, zOffset));
+    //noise = map(noise, -1.0,1.0,0.0,1.0);
+    //noise = (noise + 1) / 2;
+    //noise = ceil(noise);
+
+    Vertex vert;
+
+   
+    vert.Position = float3( (id.x + chunk_offset.x),
+                            (id.y + chunk_offset.y),
+                            (id.z + chunk_offset.z));
+	float noise = snoise(vert.Position/Scale); 
+    vert.val = map(noise,-1.0,1.0,0.0,1.0);
+    //vert.val = noise;
+    vert.Color = float4(vert.val,vert.val,vert.val, 1.0);
+    _Buffer[id.z * chunk_size * chunk_size + id.y * chunk_size + id.x] = vert;
+}
+
+
+float threshold;
+
+struct TRIANGLE {
+   float3 vert1;
+   float3 vert2;
+   float3 vert3;
+};
+
+struct OUT_TRIANGLE {
+   	float4 vert1;
+   	float4 vert2;
+   	float4 vert3;
+	
+};
+
+struct GRIDCELL {
+   float3 p[8];
+   float val[8];
+};
+
+
+/*
+   Linearly interpolate the position where an isosurface cuts
+   an edge between two vertices, each with their own scalar value
+*/
+
+float4 VertexInterp(float isolevel, float3 p1, float3 p2, float valp1, float valp2)
+{
+   float mu;
+   float4 p;
+    
+   if (abs(isolevel-valp1) < 0.00001){
+      p = float4(p1.x, p1.y, p1.z, map(valp1, threshold, 1, 0,1));
+	  return(p);
+
+   }
+   if (abs(isolevel-valp2) < 0.00001)
+   {
+		p = float4(p2.x, p2.y, p2.z, map(valp2, threshold, 1, 0,1));
+		return(p);
+   }
+      
+   if (abs(valp1-valp2) < 0.00001){
+	  p = float4(p1.x, p1.y, p1.z, map(valp1, threshold, 1, 0,1));
+	  return(p);
+   }
+      
+   mu = (isolevel - valp1) / (valp2 - valp1);
+   p.x = p1.x + mu * (p2.x - p1.x);
+   p.y = p1.y + mu * (p2.y - p1.y);
+   p.z = p1.z + mu * (p2.z - p1.z);
+   p.w = map((valp1+valp2)/2, threshold, 1, 0,1);
+
+   return p;
+}
+
+
+AppendStructuredBuffer<OUT_TRIANGLE> _Triangles;
+
+int indexFromCoord(int x, int y, int z) {
+    return z * chunk_size * chunk_size + y * chunk_size + x;
+}
+
+[numthreads(thread_count,thread_count,thread_count)]
+void Marching(uint3 id : SV_DispatchThreadID){
+    int index = indexFromCoord(id.x, id.y, id.z);
+    int3 pos = _Buffer[index].Position;
+
+    if(pos.x < chunk_size+chunk_offset.x - 1 && pos.y < chunk_size+chunk_offset.y - 1 && pos.z < chunk_size+chunk_offset.z - 1)
+    {
+
+        GRIDCELL grid;
+		int z = id.y;
+		int y = id.z;
+		grid.p[0] = _Buffer[indexFromCoord(id.x, y, z)].Position;
+        grid.p[1] = _Buffer[indexFromCoord(id.x + 1, y, z)].Position;
+        grid.p[2] =_Buffer[indexFromCoord(id.x + 1, y, z + 1)].Position;
+        grid.p[3] =_Buffer[indexFromCoord(id.x, y, z + 1)].Position;
+        grid.p[4] =_Buffer[indexFromCoord(id.x, y + 1, z)].Position;
+        grid.p[5] = _Buffer[indexFromCoord(id.x + 1, y + 1, z)].Position;
+        grid.p[6] =_Buffer[indexFromCoord(id.x + 1, y + 1, z + 1)].Position;
+        grid.p[7] = _Buffer[indexFromCoord(id.x, y + 1, z + 1)].Position;
+        
+	
+		grid.val[0] = _Buffer[indexFromCoord(id.x, y, z)].val;
+        grid.val[1] = _Buffer[indexFromCoord(id.x + 1, y, z)].val;
+        grid.val[2] =_Buffer[indexFromCoord(id.x + 1, y, z + 1)].val;
+        grid.val[3] =_Buffer[indexFromCoord(id.x, y, z + 1)].val;
+        grid.val[4] =_Buffer[indexFromCoord(id.x, y + 1, z)].val;
+        grid.val[5] = _Buffer[indexFromCoord(id.x + 1, y + 1, z)].val;
+        grid.val[6] =_Buffer[indexFromCoord(id.x + 1, y + 1, z + 1)].val;
+        grid.val[7] = _Buffer[indexFromCoord(id.x, y + 1, z + 1)].val;
+        
+       
+  
+
+  
+
+		int ntriang = 0;
+		int cubeindex;
+		float4 vertlist[12];
+
+
+		/*
+			Determine the index into the edge table which
+			tells us which vertices are inside of the surface
+		*/
+		cubeindex = 0;
+		if (grid.val[0] < threshold) cubeindex |= 1;
+		if (grid.val[1] < threshold) cubeindex |= 2;
+		if (grid.val[2] < threshold) cubeindex |= 4;
+		if (grid.val[3] < threshold) cubeindex |= 8;
+		if (grid.val[4] < threshold) cubeindex |= 16;
+		if (grid.val[5] < threshold) cubeindex |= 32;
+		if (grid.val[6] < threshold) cubeindex |= 64;
+		if (grid.val[7] < threshold) cubeindex |= 128;
+
+		/* Cube is entirely in/out of the surface */
+		if (edgeTable[cubeindex] == 0)
+		{
+			return;
+		}
+
+		/* Find the vertices where the surface intersects the cube */
+		if (edgeTable[cubeindex] & 1)
+			vertlist[0] =
+				VertexInterp(threshold,grid.p[0],grid.p[1],grid.val[0],grid.val[1]);
+		if (edgeTable[cubeindex] & 2)
+			vertlist[1] =
+				VertexInterp(threshold,grid.p[1],grid.p[2],grid.val[1],grid.val[2]);
+		if (edgeTable[cubeindex] & 4)
+			vertlist[2] =
+				VertexInterp(threshold,grid.p[2],grid.p[3],grid.val[2],grid.val[3]);
+		if (edgeTable[cubeindex] & 8)
+			vertlist[3] =
+				VertexInterp(threshold,grid.p[3],grid.p[0],grid.val[3],grid.val[0]);
+		if (edgeTable[cubeindex] & 16)
+			vertlist[4] =
+				VertexInterp(threshold,grid.p[4],grid.p[5],grid.val[4],grid.val[5]);
+		if (edgeTable[cubeindex] & 32)
+			vertlist[5] =
+				VertexInterp(threshold,grid.p[5],grid.p[6],grid.val[5],grid.val[6]);
+		if (edgeTable[cubeindex] & 64)
+			vertlist[6] =
+				VertexInterp(threshold,grid.p[6],grid.p[7],grid.val[6],grid.val[7]);
+		if (edgeTable[cubeindex] & 128)
+			vertlist[7] =
+				VertexInterp(threshold,grid.p[7],grid.p[4],grid.val[7],grid.val[4]);
+		if (edgeTable[cubeindex] & 256)
+			vertlist[8] =
+				VertexInterp(threshold,grid.p[0],grid.p[4],grid.val[0],grid.val[4]);
+		if (edgeTable[cubeindex] & 512)
+			vertlist[9] =
+				VertexInterp(threshold,grid.p[1],grid.p[5],grid.val[1],grid.val[5]);
+		if (edgeTable[cubeindex] & 1024)
+			vertlist[10] =
+				VertexInterp(threshold,grid.p[2],grid.p[6],grid.val[2],grid.val[6]);
+		if (edgeTable[cubeindex] & 2048)
+			vertlist[11] =
+				VertexInterp(threshold,grid.p[3],grid.p[7],grid.val[3],grid.val[7]);
+
+		/* Create the triangle */
+			ntriang = 0;
+			
+
+		for (int i=0;triTable[cubeindex][i]!=-1;i+=3) {
+			OUT_TRIANGLE tri;
+			tri.vert1 = vertlist[triTable[cubeindex][i]];
+			tri.vert2 = vertlist[triTable[cubeindex][i+1]];
+			tri.vert3 = vertlist[triTable[cubeindex][i+2]];
+
+			// tri.vert1 = float3(123,123,123);
+			// tri.vert2 = float3(123,123,123);
+			// tri.vert3 = float3(123,123,123);
+			// tri.vert4 = float3(123,123,123);
+			ntriang ++;
+			_Triangles.Append(tri);
+		}
+		
+        
+        // for(int i = 0; i < 8; i++){
+        //     _Vertices[index*8+i] = cell.p[i];   
+        // }
+       
+        //_Vertices[0].x = 112121;
+    }
+    
+}
